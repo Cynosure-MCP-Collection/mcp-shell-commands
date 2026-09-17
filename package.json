@@ -1,0 +1,53 @@
+{
+  "name": "@cynosure-mcp/shell-commands",
+  "mcpName": "io.github.andreasjhagen/shell-commands",
+  "version": "0.1.0",
+  "description": "MCP server for running Bash shell commands with configurable working directories, timeouts, and output limits",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "shell-commands": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "npm run build && node test/smoke.mjs",
+    "release:check": "node scripts/sync-version.mjs --check",
+    "version": "node scripts/sync-version.mjs && git add server.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "files": [
+    "dist",
+    "server.json",
+    "icon.png"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "shell",
+    "bash",
+    "terminal",
+    "command-execution",
+    "ai"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Cynosure-MCP-Collection/mcp-shell-commands.git"
+  },
+  "homepage": "https://github.com/Cynosure-MCP-Collection/mcp-shell-commands#readme",
+  "bugs": {
+    "url": "https://github.com/Cynosure-MCP-Collection/mcp-shell-commands/issues"
+  }
+}
