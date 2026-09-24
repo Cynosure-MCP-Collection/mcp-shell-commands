@@ -1,9 +1,12 @@
 {
   "name": "@cynosure-mcp/shell-commands",
   "mcpName": "io.github.andreasjhagen/shell-commands",
-  "version": "0.1.0",
-  "description": "MCP server for running Bash shell commands with configurable working directories, timeouts, and output limits",
+  "version": "0.2.0",
+  "description": "MCP server for running and interacting with managed Bash and terminal processes",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "main": "dist/index.js",
   "bin": {
     "shell-commands": "dist/index.js"
@@ -12,13 +15,16 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "npm run build && node test/smoke.mjs",
+    "test": "npm run build && node --test test/*.test.mjs && node test/smoke.mjs",
     "release:check": "node scripts/sync-version.mjs --check",
     "version": "node scripts/sync-version.mjs && git add server.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "zod": "^3.24.0"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

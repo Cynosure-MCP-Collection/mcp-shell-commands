@@ -1,215 +1,17 @@
 #!/usr/bin/env node
-import { spawn } from 'node:child_process';
-import { promises as fs } from 'node:fs';
-import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-
-const VERSION = '0.1.0';
-const MIN_TIMEOUT_MS = 100;
-const ABSOLUTE_MAX_TIMEOUT_MS = 3_600_000;
-const DEFAULT_TIMEOUT_MS = boundedInteger('SHELL_COMMANDS_DEFAULT_TIMEOUT_MS', 120_000, MIN_TIMEOUT_MS, ABSOLUTE_MAX_TIMEOUT_MS);
-const MAX_TIMEOUT_MS = boundedInteger('SHELL_COMMANDS_MAX_TIMEOUT_MS', 600_000, MIN_TIMEOUT_MS, ABSOLUTE_MAX_TIMEOUT_MS);
-const MAX_OUTPUT_BYTES = boundedInteger('SHELL_COMMANDS_MAX_OUTPUT_BYTES', 256 * 1024, 1024, 10 * 1024 * 1024);
-const SHELL = process.env.SHELL_COMMANDS_SHELL || (process.platform === 'win32' ? 'bash' : '/bin/bash');
-
-function boundedInteger(name: string, fallback: number, min: number, max: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
-    throw new Error(`${name} must be an integer between ${min} and ${max}.`);
-  }
-  return parsed;
-}
-
-function configuredAllowedDirectories(): string[] {
-  const configured = process.env.SHELL_COMMANDS_ALLOWED_DIRECTORIES;
-  const directories = configured
-    ? configured.split(path.delimiter).map(value => value.trim()).filter(Boolean)
-    : [process.cwd()];
-  return [...new Set(directories.map(directory => path.resolve(directory)))];
-}
-
-const ALLOWED_DIRECTORIES = configuredAllowedDirectories();
-
-function isWithin(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return relative === '' || (
-    relative !== '..'
-    && !relative.startsWith(`..${path.sep}`)
-    && !path.isAbsolute(relative)
-  );
-}
-
-async function resolveWorkingDirectory(input?: string): Promise<string> {
-  const requested = path.resolve(input || process.cwd());
-  const resolved = await fs.realpath(requested);
-  const stats = await fs.stat(resolved);
-  if (!stats.isDirectory()) throw new Error(`Working directory is not a directory: ${input}`);
-
-  for (const configuredRoot of ALLOWED_DIRECTORIES) {
-    let root: string;
-    try {
-      root = await fs.realpath(configuredRoot);
-    } catch {
-      continue;
-    }
-    if (isWithin(root, resolved)) return resolved;
-  }
-
-  throw new Error(`Working directory is outside SHELL_COMMANDS_ALLOWED_DIRECTORIES: ${input || process.cwd()}`);
-}
-
-interface CapturedStream {
-  chunks: Buffer[];
-  bytes: number;
-  truncated: boolean;
-}
-
-function captureChunk(stream: CapturedStream, chunk: Buffer): void {
-  const remaining = MAX_OUTPUT_BYTES - stream.bytes;
-  if (remaining <= 0) {
-    stream.truncated = true;
-    return;
-  }
-  if (chunk.length > remaining) {
-    stream.chunks.push(chunk.subarray(0, remaining));
-    stream.bytes += remaining;
-    stream.truncated = true;
-    return;
-  }
-  stream.chunks.push(chunk);
-  stream.bytes += chunk.length;
-}
-
-function streamText(stream: CapturedStream): string {
-  const text = Buffer.concat(stream.chunks).toString('utf8');
-  return stream.truncated ? `${text}\n[output truncated after ${MAX_OUTPUT_BYTES} bytes]` : text;
-}
-
-function terminateProcess(pid: number | undefined, signal: NodeJS.Signals): void {
-  if (!pid) return;
-  try {
-    if (process.platform === 'win32') process.kill(pid, signal);
-    else process.kill(-pid, signal);
-  } catch {
-    // The process may already have exited.
-  }
-}
-
-interface CommandResult {
-  exitCode: number | null;
-  signal: NodeJS.Signals | null;
-  stdout: string;
-  stderr: string;
-  timedOut: boolean;
-  cancelled: boolean;
-  durationMs: number;
-}
-
-async function runCommand(options: {
-  command: string;
-  cwd: string;
-  timeoutMs: number;
-  stdin?: string;
-  environment?: Record<string, string>;
-  unsetEnvironment?: string[];
-  abortSignal?: AbortSignal;
-}): Promise<CommandResult> {
-  return new Promise((resolve, reject) => {
-    const environment: NodeJS.ProcessEnv = { ...process.env, ...options.environment };
-    for (const name of options.unsetEnvironment || []) delete environment[name];
-
-    const stdout: CapturedStream = { chunks: [], bytes: 0, truncated: false };
-    const stderr: CapturedStream = { chunks: [], bytes: 0, truncated: false };
-    const startedAt = Date.now();
-    let timedOut = false;
-    let cancelled = false;
-    let settled = false;
-    let stopping = false;
-    let forceKillTimer: NodeJS.Timeout | undefined;
-
-    const child = spawn(SHELL, ['-lc', options.command], {
-      cwd: options.cwd,
-      env: environment,
-      detached: process.platform !== 'win32',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    child.stdout.on('data', (chunk: Buffer) => captureChunk(stdout, chunk));
-    child.stderr.on('data', (chunk: Buffer) => captureChunk(stderr, chunk));
-
-    const stop = (reason: 'timeout' | 'cancelled') => {
-      if (settled || stopping) return;
-      stopping = true;
-      timedOut = reason === 'timeout';
-      cancelled = reason === 'cancelled';
-      terminateProcess(child.pid, 'SIGTERM');
-      forceKillTimer = setTimeout(() => terminateProcess(child.pid, 'SIGKILL'), 1_000);
-      forceKillTimer.unref();
-    };
-
-    const timeout = setTimeout(() => stop('timeout'), options.timeoutMs);
-    timeout.unref();
-    const onAbort = () => stop('cancelled');
-    options.abortSignal?.addEventListener('abort', onAbort, { once: true });
-    if (options.abortSignal?.aborted) onAbort();
-
-    child.once('error', error => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      options.abortSignal?.removeEventListener('abort', onAbort);
-      reject(error);
-    });
-
-    child.once('close', (exitCode, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      options.abortSignal?.removeEventListener('abort', onAbort);
-      resolve({
-        exitCode,
-        signal,
-        stdout: streamText(stdout),
-        stderr: streamText(stderr),
-        timedOut,
-        cancelled,
-        durationMs: Date.now() - startedAt,
-      });
-    });
-
-    if (options.stdin !== undefined) child.stdin.end(options.stdin);
-    else child.stdin.end();
-  });
-}
-
-function formatResult(command: string, cwd: string, result: CommandResult): string {
-  const status = result.timedOut
-    ? 'timed out'
-    : result.cancelled
-      ? 'cancelled'
-      : result.signal
-        ? `terminated by ${result.signal}`
-        : `exited with code ${result.exitCode}`;
-  const stdout = result.stdout || '(empty)';
-  const stderr = result.stderr || '(empty)';
-  return [
-    `Command ${status} after ${result.durationMs} ms.`,
-    `Working directory: ${cwd}`,
-    `Command: ${command}`,
-    '',
-    'stdout:',
-    stdout,
-    '',
-    'stderr:',
-    stderr,
-  ].join('\n');
-}
+import {
+  config,
+  DEFAULT_YIELD_MS,
+  MAX_RUNTIME_MS,
+  MAX_YIELD_MS,
+  MIN_YIELD_MS,
+  VERSION,
+} from './config.js';
+import { ProcessManager, type ProcessResult } from './process-manager.js';
 
 const EnvironmentSchema = z.record(
   z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),
@@ -220,75 +22,146 @@ const UnsetEnvironmentSchema = z.array(
   z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),
 ).max(100);
 
-const server = new McpServer({
-  name: '@cynosure-mcp/shell-commands',
-  title: 'Shell Commands',
-  version: VERSION,
-  description: 'Run Bash shell commands with configurable working directories, timeouts, environment values, stdin, and bounded output.',
-  icons: [{ src: `https://unpkg.com/@cynosure-mcp/shell-commands@${VERSION}/icon.png`, mimeType: 'image/png' }],
+const ResultSchema = z.object({
+  mode: z.enum(['pipes', 'pty']).nullable(),
+  status: z.enum(['running', 'exited', 'error']),
+  session_id: z.string().nullable(),
+  exit_code: z.number().int().nullable(),
+  signal: z.string().nullable(),
+  termination_reason: z.enum(['exit', 'signal', 'timeout', 'cancelled', 'idle_timeout', 'terminated', 'killed']).nullable(),
+  duration_ms: z.number().int().nonnegative(),
+  stdout: z.string().nullable(),
+  stderr: z.string().nullable(),
+  output: z.string().nullable(),
+  truncated: z.boolean(),
+  dropped_bytes: z.object({ stdout: z.number().int(), stderr: z.number().int(), output: z.number().int() }),
+  error: z.string().nullable(),
 });
 
-server.registerTool('execute_shell_command', {
-  title: 'Execute Shell Command',
-  description: 'Run one command string through Bash. Supports shell syntax including pipelines, redirects, conditionals, and built-ins. Commands have the full operating-system permissions of this MCP server.',
-  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-  inputSchema: {
-    command: z.string().min(1).max(131_072).describe('Bash command string to execute.'),
-    cwd: z.string().optional().describe('Starting working directory. Must be within a configured allowed directory. Defaults to the server working directory.'),
-    timeout_ms: z.number().int().min(MIN_TIMEOUT_MS).max(MAX_TIMEOUT_MS).default(Math.min(DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS)).describe(`Timeout in milliseconds (maximum ${MAX_TIMEOUT_MS}).`),
-    stdin: z.string().max(1_048_576).optional().describe('Optional UTF-8 text sent to the command on standard input.'),
-    environment: EnvironmentSchema.optional().describe('Environment variables to add or override for this command.'),
-    unset_environment: UnsetEnvironmentSchema.optional().describe('Inherited environment-variable names to remove for this command.'),
-  },
-}, async ({ command, cwd, timeout_ms, stdin, environment, unset_environment }, extra) => {
-  try {
-    const resolvedCwd = await resolveWorkingDirectory(cwd);
-    const result = await runCommand({
-      command,
-      cwd: resolvedCwd,
-      timeoutMs: timeout_ms,
-      stdin,
-      environment,
-      unsetEnvironment: unset_environment,
-      abortSignal: extra.signal,
-    });
-    return {
-      content: [{ type: 'text', text: formatResult(command, resolvedCwd, result) }],
-      isError: result.timedOut || result.cancelled || result.exitCode !== 0,
-    };
-  } catch (error) {
-    return {
-      content: [{ type: 'text', text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
-      isError: true,
-    };
+export function formatResult(result: ProcessResult): string {
+  if (result.status === 'error') return `Error: ${result.error ?? 'Unknown process error'}`;
+  const chunks: string[] = [];
+  if (result.mode === 'pipes') {
+    if (result.stdout) chunks.push(result.stdout);
+    if (result.stderr) chunks.push(`stderr:\n${result.stderr}`);
+  } else if (result.output) chunks.push(result.output);
+
+  if (result.truncated) {
+    const total = result.dropped_bytes.stdout + result.dropped_bytes.stderr + result.dropped_bytes.output;
+    chunks.push(`[${total} earlier output bytes dropped]`);
   }
-});
+  if (result.status === 'running') chunks.push(`[process running; session_id=${result.session_id}]`);
+  else {
+    const completion = result.termination_reason === 'exit'
+      ? `exit code ${result.exit_code}`
+      : `${result.termination_reason}${result.signal ? ` (${result.signal})` : ''}`;
+    chunks.push(`[process completed: ${completion}; ${result.duration_ms} ms]`);
+  }
+  return chunks.join('\n');
+}
 
-server.registerTool('get_shell_configuration', {
-  title: 'Get Shell Configuration',
-  description: 'Report the effective shell-command limits and permitted starting directories. Environment values are not included.',
-  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  inputSchema: {},
-}, async () => ({
-  content: [{
-    type: 'text',
-    text: JSON.stringify({
-      shell: SHELL,
-      allowedDirectories: ALLOWED_DIRECTORIES,
-      defaultTimeoutMs: Math.min(DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS),
-      maximumTimeoutMs: MAX_TIMEOUT_MS,
-      maximumOutputBytesPerStream: MAX_OUTPUT_BYTES,
-    }, null, 2),
-  }],
-}));
+function toolResult(result: ProcessResult) {
+  const failed = result.status === 'error'
+    || (result.status === 'exited' && (result.termination_reason !== 'exit' || result.exit_code !== 0));
+  return {
+    content: [{ type: 'text' as const, text: formatResult(result) }],
+    structuredContent: result,
+    isError: failed,
+  };
+}
+
+export function createServer(manager = new ProcessManager()): McpServer {
+  const server = new McpServer({
+    name: '@cynosure-mcp/shell-commands',
+    title: 'Shell Commands',
+    version: VERSION,
+    description: 'Run Bash commands and interact with managed long-running or terminal processes.',
+    icons: [{ src: `https://unpkg.com/@cynosure-mcp/shell-commands@${VERSION}/icon.png`, mimeType: 'image/png' }],
+  }, {
+    instructions: `Use exec_command to start Bash commands. It returns a session_id when a command is still running; pass that ID to interact_with_process to poll output, write stdin, resize a PTY, or stop it. Output is bounded to ${config.maxOutputBytes} bytes per stream and sessions expire after ${config.sessionIdleTimeoutMs} ms without interaction. Commands have the full OS permissions of this server.`,
+  });
+
+  server.registerTool('exec_command', {
+    title: 'Execute Command',
+    description: `Run a command with ${config.shell} -c. Returns on completion or after yield-time with a managed session ID. At most ${config.maxConcurrentProcesses} processes may run concurrently.`,
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    inputSchema: z.object({
+      command: z.string().min(1).max(131_072).describe('Bash command string to execute.'),
+      cwd: z.string().optional().describe('Existing starting working directory. Defaults to the server working directory.'),
+      yield_time_ms: z.number().int().min(MIN_YIELD_MS).max(MAX_YIELD_MS).default(DEFAULT_YIELD_MS).describe('How long to wait for completion before returning a managed session.'),
+      timeout_ms: z.number().int().min(100).max(MAX_RUNTIME_MS).optional().describe('Optional absolute runtime limit. Omit for no runtime limit.'),
+      stdin: z.string().max(1_048_576).optional().describe('Initial UTF-8 text written exactly as supplied.'),
+      close_stdin: z.boolean().optional().describe('Close stdin after initial input. Defaults to true for pipes and false for PTY mode.'),
+      environment: EnvironmentSchema.optional().describe('Environment variables to add or override.'),
+      unset_environment: UnsetEnvironmentSchema.optional().describe('Inherited environment-variable names to remove.'),
+      pty: z.boolean().default(false).describe('Use an interactive pseudo-terminal. Requires the optional node-pty dependency.'),
+      columns: z.number().int().min(20).max(500).default(120).describe('PTY width in columns.'),
+      rows: z.number().int().min(5).max(200).default(30).describe('PTY height in rows.'),
+    }),
+    outputSchema: ResultSchema,
+  }, async (args, extra) => toolResult(await manager.execute({
+    command: args.command,
+    cwd: args.cwd,
+    yieldTimeMs: args.yield_time_ms,
+    timeoutMs: args.timeout_ms,
+    stdin: args.stdin,
+    closeStdin: args.close_stdin,
+    environment: args.environment,
+    unsetEnvironment: args.unset_environment,
+    pty: args.pty,
+    columns: args.columns,
+    rows: args.rows,
+  }, extra.signal)));
+
+  server.registerTool('interact_with_process', {
+    title: 'Interact with Process',
+    description: 'Poll incremental output from a managed process, write exact input, close pipe stdin, resize a PTY, or send a control signal.',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    inputSchema: z.object({
+      session_id: z.string().uuid().describe('Session ID returned by exec_command.'),
+      input: z.string().max(1_048_576).optional().describe('UTF-8 text written exactly as supplied; no newline is added.'),
+      close_stdin: z.boolean().default(false).describe('Close stdin for a pipe-mode process after any input.'),
+      signal: z.enum(['interrupt', 'terminate', 'kill']).optional().describe('Signal the process instead of writing input.'),
+      yield_time_ms: z.number().int().min(MIN_YIELD_MS).max(MAX_YIELD_MS).default(1_000).describe('How long to wait for new output or process exit.'),
+      columns: z.number().int().min(20).max(500).optional().describe('New PTY width; must be supplied with rows.'),
+      rows: z.number().int().min(5).max(200).optional().describe('New PTY height; must be supplied with columns.'),
+    }),
+    outputSchema: ResultSchema,
+  }, async (args, extra) => toolResult(await manager.interact({
+    sessionId: args.session_id,
+    input: args.input,
+    closeStdin: args.close_stdin,
+    signal: args.signal,
+    yieldTimeMs: args.yield_time_ms,
+    columns: args.columns,
+    rows: args.rows,
+  }, extra.signal)));
+
+  return server;
+}
 
 async function main(): Promise<void> {
+  const manager = new ProcessManager();
+  const server = createServer(manager);
   const transport = new StdioServerTransport();
+  let closing = false;
+  const shutdown = async () => {
+    if (closing) return;
+    closing = true;
+    await manager.shutdown();
+  };
+  server.server.onclose = () => void shutdown();
+  process.once('SIGINT', () => void shutdown().finally(() => process.exit(130)));
+  process.once('SIGTERM', () => void shutdown().finally(() => process.exit(143)));
+  process.stdin.once('end', () => void shutdown());
   await server.connect(transport);
   process.stderr.write(`Shell Commands MCP ${VERSION} ready\n`);
 }
 
-main().catch(error => {
-  process.stderr.write(`Shell Commands MCP failed: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
-  process.exit(1);
-});
+const isEntrypoint = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isEntrypoint) {
+  main().catch(error => {
+    process.stderr.write(`Shell Commands MCP failed: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}

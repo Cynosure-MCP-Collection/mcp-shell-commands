@@ -16,18 +16,11 @@ try {
   const listed = await client.listTools();
   assert.deepEqual(
     listed.tools.map(tool => tool.name).sort(),
-    ['execute_shell_command', 'get_shell_configuration'],
+    ['exec_command', 'interact_with_process'],
   );
 
-  const configuration = await client.callTool({
-    name: 'get_shell_configuration',
-    arguments: {},
-  });
-  assert.notEqual(configuration.isError, true);
-  assert.match(configuration.content[0].text, /maximumOutputBytesPerStream/);
-
   const successful = await client.callTool({
-    name: 'execute_shell_command',
+    name: 'exec_command',
     arguments: {
       command: 'read value; printf "%s:%s" "$GREETING" "$value"',
       stdin: 'world\n',
@@ -35,29 +28,44 @@ try {
     },
   });
   assert.equal(successful.isError, false);
-  assert.match(successful.content[0].text, /hello:world/);
+  assert.equal(successful.structuredContent.status, 'exited');
+  assert.equal(successful.structuredContent.stdout, 'hello:world');
+
+  const ongoing = await client.callTool({
+    name: 'exec_command',
+    arguments: {
+      command: 'printf ready; read value; printf ":%s" "$value"',
+      close_stdin: false,
+      yield_time_ms: 250,
+    },
+  });
+  assert.equal(ongoing.structuredContent.status, 'running');
+  assert.equal(ongoing.structuredContent.stdout, 'ready');
+  const sessionId = ongoing.structuredContent.session_id;
+  assert.equal(typeof sessionId, 'string');
+
+  let completed = await client.callTool({
+    name: 'interact_with_process',
+    arguments: { session_id: sessionId, input: 'done\n', close_stdin: true, yield_time_ms: 1000 },
+  });
+  let output = completed.structuredContent.stdout ?? '';
+  if (completed.structuredContent.status === 'running') {
+    completed = await client.callTool({
+      name: 'interact_with_process',
+      arguments: { session_id: sessionId, yield_time_ms: 1000 },
+    });
+    output += completed.structuredContent.stdout ?? '';
+  }
+  assert.equal(completed.structuredContent.status, 'exited');
+  assert.equal(output, ':done');
 
   const failed = await client.callTool({
-    name: 'execute_shell_command',
+    name: 'exec_command',
     arguments: { command: 'printf failure >&2; exit 7' },
   });
   assert.equal(failed.isError, true);
-  assert.match(failed.content[0].text, /exited with code 7/);
-  assert.match(failed.content[0].text, /failure/);
-
-  const timedOut = await client.callTool({
-    name: 'execute_shell_command',
-    arguments: { command: 'sleep 2', timeout_ms: 100 },
-  });
-  assert.equal(timedOut.isError, true);
-  assert.match(timedOut.content[0].text, /timed out/);
-
-  const rejectedDirectory = await client.callTool({
-    name: 'execute_shell_command',
-    arguments: { command: 'pwd', cwd: '/' },
-  });
-  assert.equal(rejectedDirectory.isError, true);
-  assert.match(rejectedDirectory.content[0].text, /outside SHELL_COMMANDS_ALLOWED_DIRECTORIES/);
+  assert.equal(failed.structuredContent.exit_code, 7);
+  assert.equal(failed.structuredContent.stderr, 'failure');
 
   process.stdout.write('Smoke tests passed.\n');
 } finally {
