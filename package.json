@@ -1,7 +1,7 @@
 {
   "name": "@cynosure-mcp/shell-commands",
   "mcpName": "io.github.andreasjhagen/shell-commands",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server for running and interacting with managed Bash and terminal processes",
   "type": "module",
   "engines": {
@@ -50,7 +50,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Cynosure-MCP-Collection/mcp-shell-commands.git"
+    "url": "git+https://github.com/andreasjhagen/mcp-shell-commands.git"
   },
   "homepage": "https://github.com/Cynosure-MCP-Collection/mcp-shell-commands#readme",
   "bugs": {
