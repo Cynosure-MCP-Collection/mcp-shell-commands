@@ -18,5 +18,10 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - name: Build native PTY dependency on macOS
+        if: runner.os == 'macOS'
+        run: npm rebuild node-pty
+        env:
+          npm_config_build_from_source: "true"
       - run: npm test
       - run: npm run release:check
